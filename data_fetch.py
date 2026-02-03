@@ -142,8 +142,181 @@ def get_daily_data(period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     return df
 
 
+def _try_seekingalpha_intraday(symbol: str, period: str = "10d") -> pd.DataFrame | None:
+    """Attempt to fetch intraday data from Seeking Alpha.
+    
+    Returns a DataFrame with datetime index and OHLCV columns, or None on failure.
+    """
+    try:
+        session = _http_session_with_retries()
+        sym = symbol.split('=')[0]
+        
+        # Try to fetch from Seeking Alpha's chart API
+        url = f"https://seekingalpha.com/api/v3/symbol/{sym}/chart"
+        params = {'period': period, 'dataType': 'minute'}
+        
+        r = session.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        
+        # Parse the response if it contains data
+        data = j.get('data', {})
+        if not data or 'chartData' not in data:
+            return None
+            
+        rows = []
+        for bar in data.get('chartData', []):
+            try:
+                ts = pd.to_datetime(bar.get('timestamp', 0), unit='s', utc=True)
+                rows.append({
+                    'Datetime': ts,
+                    'Open': float(bar.get('open', 0)),
+                    'High': float(bar.get('high', 0)),
+                    'Low': float(bar.get('low', 0)),
+                    'Close': float(bar.get('close', 0)),
+                    'Volume': int(bar.get('volume', 0))
+                })
+            except Exception:
+                continue
+        
+        if not rows:
+            return None
+            
+        df = pd.DataFrame(rows)
+        df.set_index('Datetime', inplace=True)
+        df['Date'] = pd.to_datetime(df.index).date
+        return df
+    except Exception:
+        return None
+
+
+def _try_nasdaqtrader_intraday(symbol: str, period: str = "10d") -> pd.DataFrame | None:
+    """Attempt to fetch intraday data from NASDAQ Trader.
+    
+    Returns a DataFrame with datetime index and OHLCV columns, or None on failure.
+    """
+    try:
+        session = _http_session_with_retries()
+        sym = symbol.split('=')[0]
+        
+        # Try NASDAQ Trader market data API
+        start = (pd.Timestamp.now() - pd.Timedelta(days=int(period.rstrip('d')) if period.endswith('d') else 10)).strftime('%Y%m%d')
+        end = pd.Timestamp.now().strftime('%Y%m%d')
+        
+        url = f"https://api.nasdaqtrader.com/api/quote/{sym}/intraday"
+        params = {'fromdate': start, 'todate': end, 'interval': '5'}
+        
+        r = session.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        
+        if not j or 'data' not in j:
+            return None
+            
+        rows = []
+        for bar in j.get('data', []):
+            try:
+                ts = pd.to_datetime(bar.get('timestamp'), utc=True)
+                rows.append({
+                    'Datetime': ts,
+                    'Open': float(bar.get('open', 0)),
+                    'High': float(bar.get('high', 0)),
+                    'Low': float(bar.get('low', 0)),
+                    'Close': float(bar.get('close', 0)),
+                    'Volume': int(bar.get('volume', 0))
+                })
+            except Exception:
+                continue
+        
+        if not rows:
+            return None
+            
+        df = pd.DataFrame(rows)
+        df.set_index('Datetime', inplace=True)
+        df['Date'] = pd.to_datetime(df.index).date
+        return df
+    except Exception:
+        return None
+
+
+def _try_nasdaq_com_intraday(symbol: str, period: str = "10d") -> pd.DataFrame | None:
+    """Attempt to fetch intraday data from NASDAQ.com.
+    
+    Returns a DataFrame with datetime index and OHLCV columns, or None on failure.
+    """
+    try:
+        session = _http_session_with_retries()
+        sym = symbol.split('=')[0]
+        
+        # Try NASDAQ.com historical chart API
+        start = (pd.Timestamp.now() - pd.Timedelta(days=int(period.rstrip('d')) if period.endswith('d') else 10)).strftime('%m/%d/%Y')
+        end = pd.Timestamp.now().strftime('%m/%d/%Y')
+        
+        url = f"https://api.nasdaq.com/api/quote/{sym}/intraday"
+        params = {'fromDate': start, 'toDate': end}
+        
+        r = session.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        
+        if not j or 'data' not in j:
+            return None
+            
+        rows = []
+        for bar in j.get('data', {}).get('intraday', []):
+            try:
+                ts = pd.to_datetime(bar.get('timestamp'), utc=True)
+                rows.append({
+                    'Datetime': ts,
+                    'Open': float(bar.get('open', 0)),
+                    'High': float(bar.get('high', 0)),
+                    'Low': float(bar.get('low', 0)),
+                    'Close': float(bar.get('close', 0)),
+                    'Volume': int(bar.get('volume', 0))
+                })
+            except Exception:
+                continue
+        
+        if not rows:
+            return None
+            
+        df = pd.DataFrame(rows)
+        df.set_index('Datetime', inplace=True)
+        df['Date'] = pd.to_datetime(df.index).date
+        return df
+    except Exception:
+        return None
+
+
 def get_intraday_data(period: str = "10d", interval: str = "5m") -> pd.DataFrame:
-    """Try polygon intraday (if key), otherwise yfinance intraday."""
+    """Try seekingalpha, nasdaqtrader, nasdaq.com (primary 24-hour sources),
+    then polygon intraday (if key), finally yfinance intraday."""
+    
+    # Try Seeking Alpha first (primary 24-hour source)
+    try:
+        df = _try_seekingalpha_intraday(POLY_TICKER, period=period)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    
+    # Try NASDAQ Trader second (primary 24-hour source)
+    try:
+        df = _try_nasdaqtrader_intraday(POLY_TICKER, period=period)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    
+    # Try NASDAQ.com third (primary 24-hour source)
+    try:
+        df = _try_nasdaq_com_intraday(POLY_TICKER, period=period)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    
+    # Try Polygon if API key available
     key = os.getenv("POLYGON_API_KEY")
     if key:
         try:
@@ -170,7 +343,7 @@ def get_intraday_data(period: str = "10d", interval: str = "5m") -> pd.DataFrame
         except Exception:
             pass
 
-    # Fallback to yfinance intraday
+    # Fallback to yfinance intraday (last resort)
     df = yf.download(YF_TICKER, period=period, interval=interval, auto_adjust=False)
     df.dropna(inplace=True)
     if isinstance(df.columns, pd.MultiIndex):

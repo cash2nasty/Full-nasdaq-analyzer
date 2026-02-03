@@ -11,10 +11,228 @@ from indicators import build_indicators, summarize_indicators
 from bias_engine import add_bias_columns, get_overextension_status, predict_next_day_bias
 from notes import add_note_for_date, get_notes_for_date, update_close_history
 from utils import style_stats_table
+import json
+from pathlib import Path
 
 
 st.set_page_config(page_title="Nasdaq Analyzer 3", layout="wide")
 
+
+# Session stats persistence helpers
+def _persist_session_stats(session_date: date, session_type: str, stats: dict, data_dir: str = "data") -> None:
+    """Persist session stats (Asia/London) to a JSON file after they complete.
+    
+    Args:
+        session_date: The calendar date of the trading day
+        session_type: "asia" or "london"
+        stats: Dictionary with session stats (open, close, high, low, volume, return, etc.)
+        data_dir: Directory to store the session stats
+    """
+    try:
+        p = Path(data_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        
+        # Store stats in a consolidated sessions file
+        out = p / "session_stats.json"
+        
+        # Load existing stats if present
+        existing = {}
+        if out.exists():
+            try:
+                with open(out, 'r') as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+        
+        # Initialize date entry if not present
+        date_str = session_date.isoformat()
+        if date_str not in existing:
+            existing[date_str] = {}
+        
+        # Store the session stats with completion timestamp
+        stats_copy = stats.copy()
+        stats_copy["persisted_at"] = datetime.utcnow().isoformat()
+        existing[date_str][session_type] = stats_copy
+        
+        # Write back
+        with open(out, 'w') as f:
+            json.dump(existing, f, indent=2, default=str)
+    except Exception as e:
+        # Silently fail if persistence doesn't work
+        pass
+
+
+def _load_session_stats(session_date: date, session_type: str, data_dir: str = "data") -> dict | None:
+    """Load previously persisted session stats for a given date and type.
+    
+    Args:
+        session_date: The calendar date of the trading day
+        session_type: "asia" or "london"
+        data_dir: Directory where session stats are stored
+    
+    Returns:
+        Dictionary with session stats if found, None otherwise
+    """
+    try:
+        p = Path(data_dir) / "session_stats.json"
+        if not p.exists():
+            return None
+        
+        with open(p, 'r') as f:
+            all_stats = json.load(f)
+        
+        date_str = session_date.isoformat()
+        if date_str in all_stats and session_type in all_stats[date_str]:
+            return all_stats[date_str][session_type]
+        
+        return None
+    except Exception:
+        return None
+
+
+def _get_last_daily_update(data_dir: str = "data") -> date | None:
+    """Return the date of the last automatic daily update, if available."""
+    try:
+        p = Path(data_dir) / "last_daily_update.json"
+        if not p.exists():
+            return None
+        with open(p, 'r') as f:
+            j = json.load(f)
+        if not j or 'last_update' not in j:
+            return None
+        return pd.to_datetime(j['last_update']).date()
+    except Exception:
+        return None
+
+
+def _set_last_daily_update(d: date, data_dir: str = "data") -> None:
+    try:
+        p = Path(data_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        out = p / "last_daily_update.json"
+        with open(out, 'w') as f:
+            json.dump({"last_update": d.isoformat()}, f)
+    except Exception:
+        pass
+
+
+def perform_daily_update(force: bool = False) -> bool:
+    """Perform the daily update: refresh daily dataframe, intraday, persist session stats, and update close history.
+
+    This is safe to call repeatedly; it will skip work if already run for today unless `force` is True.
+    """
+    try:
+        now_est = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+        today_est = now_est.date()
+        last = _get_last_daily_update()
+        if last == today_est and not force:
+            return False
+
+        # Rebuild daily dataframe (do not rely on cached `load_full_dataframe` here)
+        try:
+            new_df = build_base_dataframe()
+            new_df = build_indicators(new_df)
+            new_df = add_bias_columns(new_df)
+            globals()['df'] = new_df
+        except Exception:
+            pass
+
+        # Update close history CSV
+        try:
+            if 'df' in globals() and globals().get('df') is not None:
+                update_close_history(globals()['df'])
+        except Exception:
+            pass
+
+        # Refresh intraday data (fetch last few days to ensure session windows are covered)
+        try:
+            new_intra = get_intraday_data(period="3d")
+            if new_intra is not None and not new_intra.empty:
+                globals()['intra'] = new_intra
+        except Exception:
+            pass
+
+        # Persist session stats for today (sessions should be complete by 17:00 EST)
+        try:
+            # target trading date is today_est
+            td = today_est
+            # Asia session
+            try:
+                a_start, a_end = asia_window_for_date(td)
+                if 'intra' in globals() and not globals().get('intra').empty:
+                    a_slice = globals().get('intra').loc[(globals().get('intra').index >= a_start) & (globals().get('intra').index < a_end)]
+                else:
+                    a_slice = pd.DataFrame()
+                a_stats = session_stats_from_slice(a_slice)
+                if a_stats:
+                    a_stats['complete'] = True
+                    _persist_session_stats(td, 'asia', a_stats)
+            except Exception:
+                pass
+
+            # London session
+            try:
+                l_start, l_end = london_window_for_date(td)
+                if 'intra' in globals() and not globals().get('intra').empty:
+                    l_slice = globals().get('intra').loc[(globals().get('intra').index >= l_start) & (globals().get('intra').index < l_end)]
+                else:
+                    l_slice = pd.DataFrame()
+                l_stats = session_stats_from_slice(l_slice)
+                if l_stats:
+                    l_stats['complete'] = True
+                    _persist_session_stats(td, 'london', l_stats)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Record last update
+        try:
+            _set_last_daily_update(today_est)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def daily_update_if_due() -> None:
+    """Check wall-clock and run daily update once per day after 17:00 EST."""
+    try:
+        now_est = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+        today_est = now_est.date()
+        last = _get_last_daily_update()
+        # run after 17:00 EST
+        if now_est.time() >= time(17, 0) and (last is None or last < today_est):
+            updated = perform_daily_update()
+            # If we performed an update, rerun the app so UI (sidebar bounds) refreshes
+            try:
+                if updated:
+                    st.rerun()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _load_all_session_stats(data_dir: str = "data") -> dict | None:
+    """Load all session stats from the persistent file.
+    
+    Args:
+        data_dir: Directory where session stats are stored
+    
+    Returns:
+        Dictionary with all session stats (by date and session type), or None if file doesn't exist
+    """
+    try:
+        p = Path(data_dir) / "session_stats.json"
+        if not p.exists():
+            return None
+        
+        with open(p, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 @st.cache_data(show_spinner=False)
 def load_full_dataframe() -> pd.DataFrame:
@@ -237,6 +455,49 @@ latest_date = all_dates[-1] if len(all_dates) > 0 else today_est_sidebar
 
 st.sidebar.title("Sidebar Notes & Controls")
 
+# Auto-refresh mechanism: if current time is past a session end time and we haven't checked recently,
+# automatically refresh intraday data to capture just-completed session stats
+def check_and_refresh_for_completed_sessions():
+    """Check if current time is past session ends and trigger a refresh if needed."""
+    now_est = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+    today_est = now_est.date()
+    
+    # Check if we should refresh (simple heuristic: refresh if we're past session ends and haven't checked in ~5 min)
+    asia_end_est = pd.Timestamp.combine(today_est, time(1, 0)).tz_localize(ZoneInfo("America/New_York"))
+    london_end_est = pd.Timestamp.combine(today_est, time(8, 0)).tz_localize(ZoneInfo("America/New_York"))
+    
+    # If past either session end and session might have just finished, try to refresh
+    should_refresh = False
+    if now_est >= london_end_est and now_est < london_end_est + pd.Timedelta(minutes=15):
+        should_refresh = True
+    elif now_est >= asia_end_est and now_est < asia_end_est + pd.Timedelta(minutes=15) and now_est.hour < 4:
+        should_refresh = True
+    
+    if should_refresh and 'intra' in globals():
+        try:
+            new_intra = get_intraday_data()
+            if new_intra is not None and not new_intra.empty:
+                # Check if we got new data since last load
+                old_intra = globals().get('intra')
+                if old_intra is None or old_intra.empty or new_intra.index.max() > old_intra.index.max():
+                    globals()['intra'] = new_intra
+                    # Rerun to pick up new session stats
+                    st.rerun()
+        except Exception:
+            pass
+
+# Trigger the auto-refresh check
+try:
+    check_and_refresh_for_completed_sessions()
+except Exception:
+    pass
+
+# Run daily update if it's past 17:00 EST and not run yet today
+try:
+    daily_update_if_due()
+except Exception:
+    pass
+
 # Refresh control: clear caches, reload data and recompute derived stats
 if st.sidebar.button("Refresh data & recompute", key="refresh_data"):
     st.sidebar.info("Refreshing caches and reloading datasets...")
@@ -423,22 +684,36 @@ if st.sidebar.button("Run Polygon diagnostic"):
         except Exception as e:
             st.sidebar.error(f"Diagnostic failed: {str(e)}")
 
-selected_date = st.sidebar.date_input(
-    "Select date",
-    value=latest_date if latest_date <= today_est_sidebar else today_est_sidebar,
-    min_value=all_dates[0],
-    max_value=today_est_sidebar,
-)
-if isinstance(selected_date, datetime):
-    selected_date = selected_date.date()
+# prevent weekend selection: keep re-prompting if weekend is selected
+# compute max selectable date: allow next trading day after 17:00 EST
+now_est_sidebar = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+max_candidate = today_est_sidebar
+if now_est_sidebar.time() >= time(17, 0):
+    # propose next calendar day
+    cand = today_est_sidebar + timedelta(days=1)
+    # if cand falls on weekend, advance to Monday
+    if cand.weekday() >= 5:
+        days_to_add = 7 - cand.weekday()
+        cand = cand + timedelta(days=days_to_add)
+    max_candidate = cand
 
-# prevent weekend selection by adjusting to previous Friday and warning the user
-if selected_date.weekday() >= 5:
-    # Saturday -> subtract 1 day, Sunday -> subtract 2 days
-    days_to_subtract = selected_date.weekday() - 4
-    adjusted = selected_date - timedelta(days=days_to_subtract)
-    st.sidebar.warning(f"Weekend selected; using previous trading day {adjusted.isoformat()} instead.")
-    selected_date = adjusted
+while True:
+    default_val = latest_date if latest_date <= max_candidate else max_candidate
+    selected_date = st.sidebar.date_input(
+        "Select date (weekdays only)",
+        value=default_val,
+        min_value=all_dates[0],
+        max_value=max_candidate,
+    )
+    if isinstance(selected_date, datetime):
+        selected_date = selected_date.date()
+    
+    # Check if weekend (Saturday=5, Sunday=6)
+    if selected_date.weekday() >= 5:
+        st.sidebar.error(f"⚠️ {selected_date.strftime('%A')} is not a trading day. Please select a weekday (Monday-Friday).")
+        st.rerun()
+    else:
+        break
 
 # quick sidebar toggle to render News & Events panel above tabs (helpful if tab is off-screen)
 show_news_panel = st.sidebar.checkbox("Show News & Events panel", value=False)
@@ -854,7 +1129,7 @@ now_est = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
 
 # determine if the selected trading day is already over (so current-day stats should be treated as unavailable)
 today_est = now_est.date()
-trading_day_over = (sel_date < today_est) or (sel_date == latest_date and today_est > sel_date)
+trading_day_over = sel_date < today_est
 
 # if the trading day is over, hide current-day session slices (they become previous-day)
 if trading_day_over:
@@ -1126,43 +1401,78 @@ else:
 # Build stats dicts: prefer computed slice stats, but expose a 'complete' flag even when slice is empty for past dates
 if asia_slice is not None and not asia_slice.empty:
     asia_stats = {**session_stats_from_slice(asia_slice), "complete": asia_complete}
+    # If session is complete, persist the stats for future use
+    if asia_complete:
+        _persist_session_stats(sel_date, "asia", asia_stats)
 else:
-    # fallback to external ticks if available
-    try:
-        asia_from_ext = session_stats_from_external_ticks(df_ticks, asia_start, asia_end)
-    except Exception:
-        asia_from_ext = {}
-    if asia_from_ext:
-        asia_stats = {**asia_from_ext, "complete": asia_complete}
+    # Check for persisted stats first (these were saved after session completed)
+    persisted_asia = _load_session_stats(sel_date, "asia")
+    if persisted_asia:
+        asia_stats = persisted_asia
+        asia_complete = True
     else:
-        asia_stats = {"complete": asia_complete}
+        # fallback to external ticks if available
+        try:
+            asia_from_ext = session_stats_from_external_ticks(df_ticks, asia_start, asia_end)
+        except Exception:
+            asia_from_ext = {}
+        if asia_from_ext:
+            asia_stats = {**asia_from_ext, "complete": asia_complete}
+        else:
+            asia_stats = {"complete": asia_complete}
 
 if london_slice is not None and not london_slice.empty:
     london_stats = {**session_stats_from_slice(london_slice), "complete": london_complete}
+    # If session is complete, persist the stats for future use
+    if london_complete:
+        _persist_session_stats(sel_date, "london", london_stats)
 else:
-    try:
-        london_from_ext = session_stats_from_external_ticks(df_ticks, london_start, london_end)
-    except Exception:
-        london_from_ext = {}
-    if london_from_ext:
-        london_stats = {**london_from_ext, "complete": london_complete}
+    # Check for persisted stats first (these were saved after session completed)
+    persisted_london = _load_session_stats(sel_date, "london")
+    if persisted_london:
+        london_stats = persisted_london
+        london_complete = True
     else:
-        london_stats = {"complete": london_complete}
+        try:
+            london_from_ext = session_stats_from_external_ticks(df_ticks, london_start, london_end)
+        except Exception:
+            london_from_ext = {}
+        if london_from_ext:
+            london_stats = {**london_from_ext, "complete": london_complete}
+        else:
+            london_stats = {"complete": london_complete}
 
 # compute previous trading date and its session stats so previous-session sections can reference them
 prev_trading_date = None
 prev_asia_stats = {"complete": False}
 prev_london_stats = {"complete": False}
 try:
-    # if trading day is over, treat the selected_date as the previous trading date
-    if trading_day_over:
-        prev_trading_date = sel_date
+    # Find the trading date BEFORE the selected date
+    # First, try to find it from daily df
+    sel_pdt = pd.to_datetime(selected_date)
+    prior_idx = df.index[df.index < sel_pdt]
+    if len(prior_idx) > 0:
+        prev_dt = prior_idx[-1]
+        prev_trading_date = pd.to_datetime(prev_dt).date()
     else:
-        sel_pdt = pd.to_datetime(selected_date)
-        prior_idx = df.index[df.index < sel_pdt]
-        if len(prior_idx) > 0:
-            prev_dt = prior_idx[-1]
-            prev_trading_date = pd.to_datetime(prev_dt).date()
+        # Fallback: look in intraday data for any prior trading date
+        if not intra.empty:
+            intra_dates = pd.to_datetime(intra.index).date
+            unique_intra_dates = sorted(set(intra_dates))
+            prior_dates = [d for d in unique_intra_dates if d < sel_date]
+            if prior_dates:
+                prev_trading_date = prior_dates[-1]
+    
+    # If still not found, check session_stats.json for any available previous trading dates
+    if prev_trading_date is None:
+        try:
+            persisted_all = _load_all_session_stats()
+            if persisted_all:
+                available_dates = sorted([pd.to_datetime(d).date() for d in persisted_all.keys() if pd.to_datetime(d).date() < sel_date], reverse=True)
+                if available_dates:
+                    prev_trading_date = available_dates[0]
+        except Exception:
+            pass
 
     if prev_trading_date is not None:
         # Previous-day Asia session: use helper to compute 19:00 prior calendar day -> 01:00 prev_trading_date (EST)
@@ -1170,7 +1480,11 @@ try:
         prev_asia_slice = intra.loc[(intra.index >= prev_asia_start) & (intra.index < prev_asia_end)] if not intra.empty else pd.DataFrame()
         prev_asia_stats_raw = session_stats_from_slice(prev_asia_slice)
         # For previous trading days, treat sessions as complete (they are in the past).
-        if prev_asia_stats_raw:
+        # First check for persisted stats, then fall back to computed stats
+        persisted_prev_asia = _load_session_stats(prev_trading_date, "asia")
+        if persisted_prev_asia:
+            prev_asia_stats = persisted_prev_asia
+        elif prev_asia_stats_raw:
             prev_asia_stats = {**prev_asia_stats_raw, "complete": True}
         else:
             prev_asia_stats = {"complete": True, "open": None, "close": None, "high": None, "low": None, "volume": 0, "return": None, "first_ts": None, "last_ts": None}
@@ -1179,7 +1493,11 @@ try:
         prev_london_start, prev_london_end = london_window_for_date(prev_trading_date)
         prev_london_slice = intra.loc[(intra.index >= prev_london_start) & (intra.index < prev_london_end)] if not intra.empty else pd.DataFrame()
         prev_london_stats_raw = session_stats_from_slice(prev_london_slice)
-        if prev_london_stats_raw:
+        # First check for persisted stats, then fall back to computed stats
+        persisted_prev_london = _load_session_stats(prev_trading_date, "london")
+        if persisted_prev_london:
+            prev_london_stats = persisted_prev_london
+        elif prev_london_stats_raw:
             prev_london_stats = {**prev_london_stats_raw, "complete": True}
         else:
             prev_london_stats = {"complete": True, "open": None, "close": None, "high": None, "low": None, "volume": 0, "return": None, "first_ts": None, "last_ts": None}
@@ -1506,7 +1824,8 @@ if selected_tab == "Asia Session":
     if now_est < asia_start:
         st.info("Asia session has not started yet for this date — check back when the session is over.")
     else:
-        if asia_slice is not None and not asia_slice.empty:
+        # Show stats if available (either from slice or from persisted data)
+        if asia_stats.get("first_ts") is not None or asia_stats.get("open") is not None:
             status = "(complete)" if asia_stats.get("complete", False) else "(in progress)"
             st.write(f"Session status: {status}")
             st.write(asia_stats)
@@ -1525,9 +1844,9 @@ if selected_tab == "Asia Session":
                     size_adj = "Small"
                 st.write(f"Range: {rng:.2f} ({pct:.3%}) — {size_adj}")
 
-                # trend detection
-                slc = asia_slice
-                if slc.shape[0] >= 2:
+                # trend detection (only if we have actual slice data)
+                if asia_slice is not None and not asia_slice.empty and asia_slice.shape[0] >= 2:
+                    slc = asia_slice
                     s_first = slc.iloc[0]["Open"]
                     s_last = slc.iloc[-1]["Close"]
                     slope = (s_last - s_first) / s_first if s_first else 0
@@ -1549,11 +1868,30 @@ if selected_tab == "Asia Session":
 
     # Previous-day Asia session (below)
     st.subheader("Previous Trading Day Asia Session")
-    if prev_trading_date is not None and prev_asia_stats.get("first_ts") is not None:
-        st.write(f"Session for previous trading date: {prev_trading_date.isoformat()}")
-        st.write(prev_asia_stats)
+    # If prev_trading_date wasn't found earlier, attempt to locate one from persisted stats
+    if prev_trading_date is None:
+        try:
+            persisted_all = _load_all_session_stats()
+            if persisted_all:
+                available_dates = sorted([pd.to_datetime(d).date() for d in persisted_all.keys() if pd.to_datetime(d).date() < sel_date], reverse=True)
+                if available_dates:
+                    cand = available_dates[0]
+                    persisted_prev_asia = _load_session_stats(cand, "asia")
+                    if persisted_prev_asia:
+                        prev_trading_date = cand
+                        prev_asia_stats = persisted_prev_asia
+        except Exception:
+            pass
+
+    if prev_trading_date is not None:
+        # Show if complete (persisted data) or if has actual data values
+        if prev_asia_stats.get("complete", False) or (prev_asia_stats.get("open") is not None and isinstance(prev_asia_stats.get("open"), (int, float))):
+            st.write(f"Session for previous trading date: {prev_trading_date.isoformat()}")
+            st.write(prev_asia_stats)
+        else:
+            st.write(f"No Asia session data available for previous trading date: {prev_trading_date.isoformat()}")
     else:
-        st.write("No previous-day Asia session data available.")
+        st.write("No previous trading date found.")
 
 
 if selected_tab == "London Session":
@@ -1565,7 +1903,8 @@ if selected_tab == "London Session":
     if now_est < london_start:
         st.info("London session has not started yet for this date — check back when the session is over.")
     else:
-        if london_slice is not None and not london_slice.empty:
+        # Show stats if available (either from slice or from persisted data)
+        if london_stats.get("first_ts") is not None or london_stats.get("open") is not None:
             status = "(complete)" if london_stats.get("complete", False) else "(in progress)"
             st.write(f"Session status: {status}")
             st.write(london_stats)
@@ -1584,8 +1923,9 @@ if selected_tab == "London Session":
                     size_adj = "Small"
                 st.write(f"Range: {rng:.2f} ({pct:.3%}) — {size_adj}")
 
-                slc = london_slice
-                if slc.shape[0] >= 2:
+                # trend detection (only if we have actual slice data)
+                if london_slice is not None and not london_slice.empty and london_slice.shape[0] >= 2:
+                    slc = london_slice
                     s_first = slc.iloc[0]["Open"]
                     s_last = slc.iloc[-1]["Close"]
                     slope = (s_last - s_first) / s_first if s_first else 0
@@ -1600,24 +1940,24 @@ if selected_tab == "London Session":
                         state = "Mixed"
                     st.write(f"Behavior: {state} (slope {slope:.4f}, std {stdp:.4f})")
 
-                # Asia range break detection
-                if asia_stats and asia_stats.get("high") is not None and asia_stats.get("low") is not None:
-                    a_high = asia_stats["high"]
-                    a_low = asia_stats["low"]
-                    broke = None
-                    for ts, rowv in slc.iterrows():
-                        if rowv["High"] > a_high or rowv["Low"] < a_low:
-                            broke = ts
-                            break
-                    if broke is not None:
-                        st.write(f"London broke Asia range at {broke.tz_convert(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    else:
-                        st.write("London session did not break the Asia range.")
+                    # Asia range break detection
+                    if asia_stats and asia_stats.get("high") is not None and asia_stats.get("low") is not None:
+                        a_high = asia_stats["high"]
+                        a_low = asia_stats["low"]
+                        broke = None
+                        for ts, rowv in slc.iterrows():
+                            if rowv["High"] > a_high or rowv["Low"] < a_low:
+                                broke = ts
+                                break
+                        if broke is not None:
+                            st.write(f"London broke Asia range at {broke.tz_convert(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                        else:
+                            st.write("London session did not break the Asia range.")
 
-                    l_close = london_stats.get("close")
-                    if l_close is not None:
-                        in_range = (l_close <= a_high) and (l_close >= a_low)
-                        st.write("London close is inside Asia range." if in_range else "London close is outside Asia range.")
+                        l_close = london_stats.get("close")
+                        if l_close is not None:
+                            in_range = (l_close <= a_high) and (l_close >= a_low)
+                            st.write("London close is inside Asia range." if in_range else "London close is outside Asia range.")
         else:
             if not london_stats.get("complete", False):
                 st.info("London session data is unavailable for this date — check back when the session is over.")
@@ -1626,11 +1966,30 @@ if selected_tab == "London Session":
 
     # Previous-day London session (below)
     st.subheader("Previous Trading Day London Session")
-    if prev_trading_date is not None and prev_london_stats.get("first_ts") is not None:
-        st.write(f"Session for previous trading date: {prev_trading_date.isoformat()}")
-        st.write(prev_london_stats)
+    # If prev_trading_date wasn't found earlier, attempt to locate one from persisted stats
+    if prev_trading_date is None:
+        try:
+            persisted_all = _load_all_session_stats()
+            if persisted_all:
+                available_dates = sorted([pd.to_datetime(d).date() for d in persisted_all.keys() if pd.to_datetime(d).date() < sel_date], reverse=True)
+                if available_dates:
+                    cand = available_dates[0]
+                    persisted_prev_london = _load_session_stats(cand, "london")
+                    if persisted_prev_london:
+                        prev_trading_date = cand
+                        prev_london_stats = persisted_prev_london
+        except Exception:
+            pass
+
+    if prev_trading_date is not None:
+        # Show if complete (persisted data) or if has actual data values
+        if prev_london_stats.get("complete", False) or (prev_london_stats.get("open") is not None and isinstance(prev_london_stats.get("open"), (int, float))):
+            st.write(f"Session for previous trading date: {prev_trading_date.isoformat()}")
+            st.write(prev_london_stats)
+        else:
+            st.write(f"No London session data available for previous trading date: {prev_trading_date.isoformat()}")
     else:
-        st.write("No previous-day London session data available.")
+        st.write("No previous trading date found.")
 
 
 if selected_tab == "Next-Day Forecast":
@@ -1660,8 +2019,28 @@ if selected_tab == "Next-Day Forecast":
     fd_asia_complete = (now_est >= fd_asia_end and fd_asia_has) or fd_asia_reached
     fd_london_complete = (now_est >= fd_london_end and fd_london_has) or fd_london_reached
 
-    fd_asia_stats = {**fd_asia_stats_raw, "complete": fd_asia_complete} if fd_asia_stats_raw else {"complete": False}
-    fd_london_stats = {**fd_london_stats_raw, "complete": fd_london_complete} if fd_london_stats_raw else {"complete": False}
+    # Check for persisted stats as fallback (these are saved after sessions complete)
+    persisted_fd_asia = _load_session_stats(fd, "asia")
+    persisted_fd_london = _load_session_stats(fd, "london")
+    
+    # Use persisted stats if available and mark as complete
+    if persisted_fd_asia and not fd_asia_stats_raw:
+        fd_asia_stats = persisted_fd_asia
+        fd_asia_complete = True
+    else:
+        fd_asia_stats = {**fd_asia_stats_raw, "complete": fd_asia_complete} if fd_asia_stats_raw else {"complete": False}
+        # Persist if complete
+        if fd_asia_complete and fd_asia_stats_raw:
+            _persist_session_stats(fd, "asia", fd_asia_stats)
+    
+    if persisted_fd_london and not fd_london_stats_raw:
+        fd_london_stats = persisted_fd_london
+        fd_london_complete = True
+    else:
+        fd_london_stats = {**fd_london_stats_raw, "complete": fd_london_complete} if fd_london_stats_raw else {"complete": False}
+        # Persist if complete
+        if fd_london_complete and fd_london_stats_raw:
+            _persist_session_stats(fd, "london", fd_london_stats)
 
     # source row for baseline calculations: use the last trading row before the forecast day
     try:
@@ -1843,6 +2222,9 @@ if selected_tab == "Next-Day Forecast":
         p_asia_start, p_asia_end = asia_window_for_date(prev_fd)
         p_asia_slice = intra.loc[(intra.index >= p_asia_start) & (intra.index < p_asia_end)] if not intra.empty else pd.DataFrame()
         p_asia_stats = session_stats_from_slice(p_asia_slice)
+        # Check for persisted stats as fallback
+        if not p_asia_stats:
+            p_asia_stats = _load_session_stats(prev_fd, "asia")
         if p_asia_stats:
             st.write(f"Previous trading date: {prev_fd.isoformat()} (Asia)")
             st.write({**p_asia_stats, "complete": True})
@@ -1853,6 +2235,9 @@ if selected_tab == "Next-Day Forecast":
         p_london_start, p_london_end = london_window_for_date(prev_fd)
         p_london_slice = intra.loc[(intra.index >= p_london_start) & (intra.index < p_london_end)] if not intra.empty else pd.DataFrame()
         p_london_stats = session_stats_from_slice(p_london_slice)
+        # Check for persisted stats as fallback
+        if not p_london_stats:
+            p_london_stats = _load_session_stats(prev_fd, "london")
         if p_london_stats:
             st.write(f"Previous trading date: {prev_fd.isoformat()} (London)")
             st.write({**p_london_stats, "complete": True})
