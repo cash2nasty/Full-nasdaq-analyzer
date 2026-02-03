@@ -1,7 +1,8 @@
 import pandas as pd
+from pandas.io.formats.style import Styler
 
 
-def style_stats_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_stats_table(df: pd.DataFrame) -> Styler:
     def bias_color(val):
         if val == "Bullish":
             return "background-color: #c6f6d5"  # green
