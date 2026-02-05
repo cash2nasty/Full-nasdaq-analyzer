@@ -699,10 +699,12 @@ if now_est_sidebar.time() >= time(17, 0):
 
 while True:
     default_val = latest_date if latest_date <= max_candidate else max_candidate
+    # Fallback to 1/1/2020 if no dates are available in dataset
+    min_date = all_dates[0] if len(all_dates) > 0 else date(2020, 1, 1)
     selected_date = st.sidebar.date_input(
         "Select date (weekdays only)",
         value=default_val,
-        min_value=all_dates[0],
+        min_value=min_date,
         max_value=max_candidate,
     )
     if isinstance(selected_date, datetime):
